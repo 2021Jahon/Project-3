@@ -1,13 +1,15 @@
 """
-🎯 FLASHSCORE SCORE RESOLVER v2.6 (Excel Formatting Edition)
+🎯 FLASHSCORE SCORE RESOLVER v3.3 (API DE/DF Edition)
 
 Собирает ТОЛЬКО:
 match_id, Liga, home_team, away_team, home_score, away_score,
 ht_home_score, ht_away_score, status_text, match_date
 
-Дополнительно:
-  ✅ Очистка Liga от " - Тур X" и "Новое окно"
-  ✅ Красивое форматирование Excel (ширина колонок, заморозка шапки, выравнивание)
+Ключевые изменения:
+  ✅ ИТОГОВЫЙ СЧЕТ читается из API dc_1_ (ключи DE и DF) - 100% надежно
+  ✅ Учет статуса матча (Не захватывает время как счет!)
+  ✅ Исправлен синтаксис Python
+  ✅ Защита от PermissionError при сохранении Excel
 """
 
 import asyncio
@@ -36,7 +38,7 @@ OUTPUT_SUFFIX = "_scores"
 SHEET_NAME = 0
 MATCH_ID_COLUMN = None
 
-LIMIT = None            # Для теста поставь 5, для всех - None
+LIMIT = None
 SAVE_EVERY = 20
 MAX_CONCURRENT = 3
 CHUNK_SIZE = 10
@@ -51,7 +53,6 @@ USER_AGENT = (
 )
 TIMEZONE = "Asia/Almaty"
 
-# Ширина колонок в Excel (в символах)
 COLUMN_WIDTHS = {
     'match_id':       12,
     'Liga':           35,
@@ -85,32 +86,25 @@ STATUS_MAP = {
 SEP_ROW, SEP_CELL, SEP_KV, SEP_KV_ALT = '~', '¬', '÷', '\uf037'
 
 # ============================================================================
-# ФУНКЦИЯ СОХРАНЕНИЯ EXCEL С ФОРМАТИРОВАНИЕМ
+# ФУНКЦИЯ СОХРАНЕНИЯ EXCEL
 # ============================================================================
 
 def save_with_widths(df: pd.DataFrame, path: str, columns: list):
-    """Сохраняет DataFrame в Excel и настраивает ширину, шапку и заморозку."""
     try:
-        # Записываем только нужные колонки
         df[columns].to_excel(path, index=False)
-
         wb = load_workbook(path)
         ws = wb.active
 
-        # 1. Ширина колонок
         for i, col in enumerate(columns, start=1):
             letter = get_column_letter(i)
             ws.column_dimensions[letter].width = COLUMN_WIDTHS.get(col, 15)
 
-        # 2. Жирная шапка + по центру + перенос текста
         for cell in ws[1]:
             cell.font = Font(bold=True)
             cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
 
-        # 3. Заморозка первой строки (шапка всегда видна при скролле)
         ws.freeze_panes = "A2"
 
-        # 4. Выравнивание счетов по центру
         score_cols = {'home_score', 'away_score', 'ht_home_score', 'ht_away_score'}
         for i, col in enumerate(columns, start=1):
             if col in score_cols:
@@ -119,6 +113,8 @@ def save_with_widths(df: pd.DataFrame, path: str, columns: list):
                     cell.alignment = Alignment(horizontal='center')
 
         wb.save(path)
+    except PermissionError:
+        logger.error(f"❌ Ошибка сохранения: закройте файл {path} в Excel!")
     except Exception as e:
         logger.warning(f"⚠️ Ошибка форматирования Excel: {e}")
 
@@ -181,7 +177,9 @@ class MatchResolver:
                 "ht_away_score": "", "status_text": "", "match_date": ""
             }
 
-            # 1. API dc_1_ (Дата и статус)
+            # ========================================================================
+            # 1. API dc_1_ (Дата, Статус и ИТОГОВЫЙ СЧЕТ из DE/DF)
+            # ========================================================================
             status_code = None
             try:
                 resp = await context.request.get(f"{self.api_domain}/46/x/feed/dc_1_{match_id}", headers=headers, timeout=10000)
@@ -193,11 +191,23 @@ class MatchResolver:
                             try:
                                 ts = int(kv['DC'])
                                 result['match_date'] = datetime.fromtimestamp(ts, self.timezone).strftime('%Y.%m.%d %H:%M')
-                            except: pass
-                        if kv.get('DA'): status_code = kv['DA']
-            except: pass
+                            except Exception as e:
+                                logger.debug(f"Date parse error for {match_id}: {e}")
+                        if kv.get('DA'):
+                            status_code = kv['DA']
 
-            # 2. API df_sui_1_ (Первый тайм)
+                        # 🎯 ИТОГОВЫЙ СЧЕТ ИЗ API (ключи DE и DF)
+                        # Читаем только если матч уже начался (LIVE или Завершен)
+                        if status_code in ['2', '3', '6', '7', '31']:
+                            if kv.get('DE') is not None and kv.get('DF') is not None:
+                                result['home_score'] = kv['DE']
+                                result['away_score'] = kv['DF']
+            except Exception as e:
+                logger.debug(f"API dc_1_ Error for {match_id}: {e}")
+
+            # ========================================================================
+            # 2. API df_sui_1_ (Счет первого тайма)
+            # ========================================================================
             try:
                 resp = await context.request.get(f"{self.api_domain}/46/x/feed/df_sui_1_{match_id}", headers=headers, timeout=10000)
                 if resp.status == 200:
@@ -209,20 +219,23 @@ class MatchResolver:
                                 result['ht_home_score'] = kv['IG']
                                 result['ht_away_score'] = kv['IH']
                                 break
-            except: pass
+            except Exception as e:
+                logger.debug(f"API df_sui_1_ Error for {match_id}: {e}")
 
-            # 3. DOM (FT, Команды, Лига, Дата фолбэк)
+            # ========================================================================
+            # 3. DOM (Только команды, лига, дата - БЕЗ счета!)
+            # ========================================================================
             page = None
             try:
                 page = await context.new_page()
                 await page.goto(f"{self.base_domain}/match/{match_id}/", wait_until='domcontentloaded', timeout=20000)
                 await asyncio.sleep(1.5)
 
-                dom_data = await page.evaluate('''() => {
+                dom_data = await page.evaluate(r'''() => {
                     const homeEl = document.querySelector('.duelParticipant__home .participant__participantName');
                     const awayEl = document.querySelector('.duelParticipant__away .participant__participantName');
 
-                    // --- ЛИГА (Хлебные крошки + Title) ---
+                    // --- ЛИГА ---
                     let league = "";
                     const breadcrumbs = Array.from(document.querySelectorAll('.breadcrumb__link, .breadcrumb a, [class*="breadcrumb"] a'));
                     if (breadcrumbs.length >= 2) {
@@ -236,72 +249,48 @@ class MatchResolver:
                         if (parts.length >= 2) league = parts[1].trim();
                     }
 
-                    // --- ОЧИСТКА ЛИГИ (Убираем " - Тур X" и "Новое окно") ---
-                    league = league.replace(/\\s*-\\s*(Тур|Round)\\s*\\d+/gi, '')
+                    league = league.replace(/\s*-\s*(Тур|Round)\s*\d+/gi, '')
                                    .replace(/Новое окно/gi, '')
-                                   .replace(/\\s+/g, ' ')
+                                   .replace(/\s+/g, ' ')
                                    .trim();
 
                     // --- ДАТА ---
                     const dateEl = document.querySelector('.duelParticipant__startTime, .duelParticipant__startTime div');
                     const dateStr = dateEl ? dateEl.textContent.trim() : null;
 
-                    // --- СЧЕТ (DOM + Title) ---
-                    let ftHome = null, ftAway = null;
-                    const scoreWrapper = document.querySelector('.detailScore__wrapper');
-                    if (scoreWrapper) {
-                        const spans = scoreWrapper.querySelectorAll('span');
-                        if (spans.length >= 3) {
-                            ftHome = spans[0].textContent.trim();
-                            ftAway = spans[2].textContent.trim();
-                        } else {
-                            const parts = scoreWrapper.textContent.replace(/\\s+/g, '').split('-');
-                            if (parts.length >= 2) { ftHome = parts[0]; ftAway = parts[1]; }
-                        }
-                    }
-
-                    if (!ftHome || !ftAway) {
-                        const hScore = document.querySelector('.detailScore__home');
-                        const aScore = document.querySelector('.detailScore__away');
-                        if (hScore && aScore) { ftHome = hScore.textContent.trim(); ftAway = aScore.textContent.trim(); }
-                    }
-
-                    if (!ftHome || !ftAway) {
-                        const titleMatch = document.title.match(/(\\d+)\\s*[-:]\\s*(\\d+)/);
-                        if (titleMatch) { ftHome = titleMatch[1]; ftAway = titleMatch[2]; }
-                    }
-
                     return {
                         home: homeEl ? homeEl.textContent.trim() : null,
                         away: awayEl ? awayEl.textContent.trim() : null,
                         league: league,
-                        dateStr: dateStr,
-                        ftHome: ftHome,
-                        ftAway: ftAway
+                        dateStr: dateStr
                     };
                 }''')
 
                 if dom_data:
                     result['home_team'] = dom_data.get('home') or ""
                     result['away_team'] = dom_data.get('away') or ""
-                    result['home_score'] = dom_data.get('ftHome') or ""
-                    result['away_score'] = dom_data.get('ftAway') or ""
                     result['Liga'] = dom_data.get('league') or ""
 
+                    # Фолбэк для даты из DOM
                     if not result['match_date'] and dom_data.get('dateStr'):
                         try:
                             dt = datetime.strptime(dom_data['dateStr'], '%d.%m.%Y %H:%M')
                             result['match_date'] = dt.strftime('%Y.%m.%d %H:%M')
-                        except: result['match_date'] = dom_data['dateStr']
+                        except:
+                            result['match_date'] = dom_data['dateStr']
+
             except Exception as e:
                 logger.warning(f"   [{match_id}] DOM Error: {e}")
             finally:
                 if page: await page.close()
 
-            # 4. Статус
+            # ========================================================================
+            # 4. Статус матча (с учетом наличия счета)
+            # ========================================================================
             if status_code:
                 result['status_text'] = STATUS_MAP.get(status_code, 'Другой')
             elif result['home_score'] != "":
+                # Если счет есть, но статус не пришел из API - считаем завершенным
                 result['status_text'] = 'Завершен'
             else:
                 result['status_text'] = 'Неизвестно'
@@ -329,7 +318,8 @@ async def main():
     ]
 
     for col in target_columns:
-        if col not in df.columns: df[col] = ""
+        if col not in df.columns:
+            df[col] = ""
 
     base, ext = os.path.splitext(INPUT_EXCEL)
     output_path = f"{base}{OUTPUT_SUFFIX}{ext}"
@@ -345,18 +335,18 @@ async def main():
 
             tasks_meta = []
             for idx, row in df.iterrows():
-                if LIMIT and len(tasks_meta) >= LIMIT: break
+                if LIMIT and len(tasks_meta) >= LIMIT:
+                    break
 
-                # Resume-логика: ищем мусор в лиге ("Тур" или "окно") или пустой счет
                 has_score = pd.notna(df.at[idx, 'home_score']) and str(df.at[idx, 'home_score']).strip() != ""
-                liga_val = str(df.at[idx, 'Liga']).strip()
-                has_dirty_league = "Тур" in liga_val or "окно" in liga_val.lower() or liga_val == ""
+                has_league = pd.notna(df.at[idx, 'Liga']) and str(df.at[idx, 'Liga']).strip() != ""
 
-                if has_score and not has_dirty_league:
+                if has_score and has_league:
                     continue
 
                 mid = str(row[id_col]).strip()
-                if len(mid) > 3: tasks_meta.append((idx, mid))
+                if len(mid) > 3:
+                    tasks_meta.append((idx, mid))
 
             logger.info(f"🎯 К обработке: {len(tasks_meta)}")
             if not tasks_meta:
