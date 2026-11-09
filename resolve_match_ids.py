@@ -95,6 +95,12 @@ def save_with_widths(df: pd.DataFrame, path: str, columns: list):
         wb = load_workbook(path)
         ws = wb.active
 
+        # Pylance: wb.active может быть None — проверяем явно
+        if ws is None:
+            logger.warning(f"⚠️ В файле {path} нет активного листа, форматирование пропущено")
+            wb.save(path)
+            return
+
         for i, col in enumerate(columns, start=1):
             letter = get_column_letter(i)
             ws.column_dimensions[letter].width = COLUMN_WIDTHS.get(col, 15)
@@ -133,23 +139,59 @@ class MatchResolver:
         context = await browser.new_context(user_agent=USER_AGENT, locale='ru-RU')
         page = await context.new_page()
         try:
-            await page.goto(f"{BASE_DOMAIN}/football/", wait_until='domcontentloaded', timeout=60000)
+            # 1. Переходим на главную
+            await page.goto(
+                f"{BASE_DOMAIN}/football/",
+                wait_until='domcontentloaded',
+                timeout=60000,
+            )
+
+            # 2. Ждём, пока утихнут все фоновые запросы (редиректы)
+            try:
+                await page.wait_for_load_state('networkidle', timeout=10000)
+            except Exception:
+                # networkidle может не сработать из-за long-polling.
+                # Не критично — идём дальше.
+                pass
+
+            # 3. Даём JS инициализироваться
             await asyncio.sleep(2)
-            env = await page.evaluate('''() => {
-                try {
-                    const env = window.environment;
-                    if (!env) return null;
-                    return {
-                        feed_sign: env.feed_sign || (env.config && env.config.feed_sign) || null,
-                        api_domain: env.feed_resolver?.local?.[0]?.url || null
-                    };
-                } catch(e) { return null; }
-            }''')
+
+            # 4. Retry-логика для evaluate (если контекст уничтожен)
+            env = None
+            for attempt in range(1, 4):
+                try:
+                    env = await page.evaluate('''() => {
+                        try {
+                            const env = window.environment;
+                            if (!env) return null;
+                            return {
+                                feed_sign: env.feed_sign || (env.config && env.config.feed_sign) || null,
+                                api_domain: env.feed_resolver?.local?.[0]?.url || null
+                            };
+                        } catch(e) { return null; }
+                    }''')
+                    break  # успех — выходим из цикла
+                except Exception as e:
+                    if attempt == 3:
+                        raise  # последняя попытка — пробрасываем
+                    logger.debug(
+                        f"⚠️ Bootstrap evaluate attempt {attempt}/3 failed: {e}"
+                    )
+                    # Ждём завершения навигации и пробуем снова
+                    try:
+                        await page.wait_for_load_state('networkidle', timeout=5000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(2)
+
             if env:
                 self.feed_sign = env.get('feed_sign') or DEFAULT_FEED_SIGN
                 self.api_domain = env.get('api_domain') or DEFAULT_API_DOMAIN
+
             logger.info(f"🌐 API: {self.api_domain} | Feed: {self.feed_sign}")
             return context
+
         except Exception as e:
             await context.close()
             raise RuntimeError(f"Bootstrap failed: {e}")
