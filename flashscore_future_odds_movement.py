@@ -1,13 +1,11 @@
 """
-📅 FLASHSCORE FUTURE FIXTURES & LINE MOVEMENT PARSER v9.5 (Pylance-Clean)
-(Exact 0/1 League Filter | Full Month Fixtures | Opening & Current Odds | Fast Refresh)
+📅 FLASHSCORE FUTURE FIXTURES & LINE MOVEMENT PARSER v9.6 (Pylance-Clean)
+(Auto GeoIP Odds Interceptor | Fast Refresh by Match ID | Exact 0/1 League Filter)
 
-Листы в создаваемом файле Excel (future_matches_movement.xlsx):
-  1. "Прогруз (Старт vs Тек)" — уникальные матчи (парное сравнение Старт и Тек)
-  2. "Текущие (Прогруз)"      — уникальные матчи (19 колонок, текущие кэфы с подсветкой)
-  3. "Стартовые (Opening)"    — уникальные матчи (19 колонок, стартовые кэфы)
-  4. "Дубликаты команд"       — последующие матчи тех же команд внутри лиги на месяц вперед
-  5. "Фильтр лиг"             — единый список всех лиг со статусом 1 (парсить) или 0 (пропускать)
+Как работает сейчас:
+  По умолчанию стоит RUN_MODE = "REFRESH" — при запуске скрипт сразу берет
+  ID матчей из файла future_matches_movement.xlsx и обновляет стартовые и текущие кэфы.
+  Для полного сбора новых матчей по датам поставьте RUN_MODE = "FULL" (или запустите с флагом --full).
 """
 
 import asyncio
@@ -20,10 +18,11 @@ from collections import defaultdict
 from datetime import datetime, date, timedelta
 from logging.handlers import RotatingFileHandler
 from typing import Any, Optional
+from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-from playwright.async_api import async_playwright, BrowserContext
+from playwright.async_api import async_playwright, BrowserContext, Request
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill
 from openpyxl.utils import get_column_letter
@@ -34,25 +33,21 @@ from openpyxl.worksheet.worksheet import Worksheet
 # ============================================================================
 
 OUTPUT_EXCEL = "future_matches_movement.xlsx"
-EXTERNAL_FILTER_EXCEL = "leagues_filter.xlsx"  # Дополнительный внешний файл фильтра (создается автоматически)
+EXTERNAL_FILTER_EXCEL = "leagues_filter.xlsx"
 
 # Режим запуска:
-#   "FULL"    — полный цикл (сбор расписания на месяц вперед + коэффициенты)
-#   "REFRESH" — быстрое обновление текущих кэфов по готовому файлу OUTPUT_EXCEL
-#   "AUTO"    — если передан аргумент --refresh (или -r), включает REFRESH, иначе FULL
-RUN_MODE: str = "AUTO"
+#   "REFRESH" — БЫСТРОЕ ОБНОВЛЕНИЕ кэфов по ID матча из готового файла OUTPUT_EXCEL
+#   "FULL"    — ПОЛНЫЙ ЦИКЛ (сбор расписания по датам на месяц вперед + кэфы)
+#   "AUTO"    — REFRESH при флаге --refresh (-r), иначе FULL
+RUN_MODE: str = "REFRESH"
 
-PRESERVE_EXISTING_OPENING: bool = True  # Сохранять стартовые кэфы при REFRESH
-REFRESH_SKIP_STARTED: bool = True       # Пропускать начавшиеся матчи при REFRESH
+PRESERVE_EXISTING_OPENING: bool = True  # Сохранять уже записанные стартовые кэфы при REFRESH
+REFRESH_SKIP_STARTED: bool = False      # False = обновлять кэфы для всех матчей из файла
 
-# Начальная дата ("ДД.ММ.ГГГГ" или None — сегодняшняя дата)
+# Начальная дата для режима FULL ("ДД.ММ.ГГГГ" или None — сегодняшняя дата)
 START_DATE: Optional[str] = "09.11.2026"
-
-# На сколько дней вперед парсить (30 дней = 1 месяц вперед: 08.11.2026 .. 08.12.2026)
 DAYS_AHEAD: int = 30
 
-# Если нужно парсить ТОЛЬКО конкретные даты — укажите их здесь.
-# Если список пустой [] — парсятся все дни подряд от START_DATE на DAYS_AHEAD дней.
 SPECIFIC_DATES: list[str] = [
     "09.11.2026",
     "10.11.2026",
@@ -72,20 +67,16 @@ SPECIFIC_DATES: list[str] = [
     "24.11.2026",
 ]
 
-ONLY_SCHEDULED: bool = True          # Только неначавшиеся матчи (статус 1)
-SKIP_WITHOUT_ODDS: bool = False      # True = скрывать матчи, на которые еще не дали кэфы
+ONLY_SCHEDULED: bool = True
+SKIP_WITHOUT_ODDS: bool = False
 DATE_OUTPUT_FORMAT = "%d.%m.%Y %H:%M"
 
 # ============================================================================
 # 2. ЕДИНЫЙ ФИЛЬТР ЛИГ (ФОРМАТ: "НАЗВАНИЕ ЛИГИ    0 или 1")
 # ============================================================================
 
-# Что ставить НОВЫМ лигам, которых еще нет в списке ниже и в Excel:
-#   1 — автоматически разрешать новые регулярные лиги (кроме молодежек/женщин/плей-офф)
-#   0 — СТРОГИЙ РЕЖИМ: парсить ТОЛЬКО те лиги, у которых явно стоит 1, а всем остальным ставить 0
-DEFAULT_NEW_LEAGUE_VALUE: int = 0
+DEFAULT_NEW_LEAGUE_VALUE: int = 1
 
-# Сюда можно напрямую вставлять скопированные из Excel строки вида: "Лига    0" или "Лига    1"
 LEAGUE_FILTER_RAW: str = """
 
 АВСТРАЛИЯ И ОКЕАНИЯ: OFC Championship U16	0
@@ -1341,7 +1332,6 @@ LEAGUE_FILTER_RAW: str = """
 
 """
 
-# Ключевые слова, которым при первом обнаружении ВСЕГДА автоматически ставится 0
 AUTO_ZERO_KEYWORDS: list[str] = [
     "- плей-офф", "(плей-офф)", "плей-офф", "play-offs", "playoffs",
     "понижение", "повышение", "матчи за место", "квалификация",
@@ -1357,33 +1347,34 @@ AUTO_ZERO_KEYWORDS: list[str] = [
 # ============================================================================
 
 UNIQUE_TEAM_FILTER: bool = True
-UNIQUE_SCOPE: str = "PER_LEAGUE"     # "PER_LEAGUE" (внутри лиги) или "GLOBAL"
+UNIQUE_SCOPE: str = "PER_LEAGUE"
 FETCH_ODDS_FOR_DUPLICATES: bool = True
-DUPLICATES_SHEET_LAYOUT: str = "COMPARISON"  # "COMPARISON", "CURRENT_19", "OPENING_19"
+DUPLICATES_SHEET_LAYOUT: str = "COMPARISON"
 STRONG_DROP_PCT: float = 5.0
-COMPARISON_LAYOUT: str = "PAIRED"    # "PAIRED" или "BLOCKS"
+COMPARISON_LAYOUT: str = "PAIRED"
 
 # ============================================================================
 # 4. СЕТЕВЫЕ НАСТРОЙКИ И СТРУКТУРА КОЛОНОК
 # ============================================================================
 
-MAX_CONCURRENT = 10
-CHUNK_SIZE = 30
-SAVE_EVERY = 80
+MAX_CONCURRENT = 8
+CHUNK_SIZE = 25
+SAVE_EVERY = 50
 
 BASE_DOMAIN = "https://www.flashscorekz.com"
 DEFAULT_API_DOMAIN = "https://46.flashscore.ninja"
 ODDS_GRAPHQL_URL = "https://global.ds.lsapp.eu/odds/pq_graphql"
 PROJECT_ID = "46"
-TZ_OFFSET = "5"          # UTC+5 (Asia/Almaty, Шымкент)
+TZ_OFFSET = "5"
 LOCALE_SUFFIX = "ru-kz_1"
 DEFAULT_FEED_SIGN = "SW9D1eZo"
 TIMEZONE = "Asia/Almaty"
 
-ODDS_QUERY_PROFILES = [
-    {"projectId": "46",   "geoIpCode": "KZ", "geoIpSubdivisionCode": "KZ"},
-    {"projectId": "2",    "geoIpCode": "GB", "geoIpSubdivisionCode": "ENG"},
-    {"projectId": "2002", "geoIpCode": "EN", "geoIpSubdivisionCode": "EN"},
+# Резервные профили для GraphQL коэффициентов (если автоперехват не сработал)
+FALLBACK_ODDS_PROFILES: list[dict[str, str]] = [
+    {"_hash": "oce", "projectId": "46", "geoIpCode": "KZ", "geoIpSubdivisionCode": "KZ75"},
+    {"_hash": "oce", "projectId": "60", "geoIpCode": "UA", "geoIpSubdivisionCode": "UA26"},
+    {"_hash": "oce", "projectId": "2",  "geoIpCode": "GB", "geoIpSubdivisionCode": "ENG"},
 ]
 
 PREFERRED_BOOKMAKERS = [16, 417, 165, 43, 14, 18]
@@ -1444,13 +1435,7 @@ SEP_ROW, SEP_CELL, SEP_KV, SEP_KV_ALT = "~", "¬", "÷", "\uf037"
 # ============================================================================
 
 class ExactLeagueFilter:
-    """
-    Хранит точное соответствие: Название лиги -> 1 (разрешена) или 0 (запрещена).
-    Не путает 'АВСТРАЛИЯ: Capital Premier League' (1) и 'АВСТРАЛИЯ: Capital Premier League - Плей-офф' (0).
-    """
-
     def __init__(self) -> None:
-        # Ключ: нижний регистр названия лиги -> (оригинальное имя, 0 или 1)
         self.rules: dict[str, tuple[str, int]] = {}
         self.match_counts: dict[str, int] = defaultdict(int)
         self._load_from_raw_text(LEAGUE_FILTER_RAW)
@@ -1469,12 +1454,10 @@ class ExactLeagueFilter:
             self.rules[key] = (clean_name, val)
 
     def _load_from_raw_text(self, raw_text: str) -> None:
-        """Разбирает строки вида 'АВСТРАЛИЯ: Capital Premier League - Плей-офф    0'."""
         for line in raw_text.splitlines():
             line_str = line.strip()
             if not line_str or line_str.startswith("#"):
                 continue
-            # Ищем 0 или 1 в конце строки после табуляции, пробелов или разделителя | ;
             m = re.match(r"^(.*?)[\t\s|;]+([01])$", line_str)
             if m:
                 lg_name = m.group(1).strip()
@@ -1504,7 +1487,6 @@ class ExactLeagueFilter:
         return loaded
 
     def load_from_excel_files(self, main_excel: str, external_excel: str) -> None:
-        """Загружает правила 0/1 из листа 'Фильтр лиг' основного файла и из leagues_filter.xlsx."""
         for path in (main_excel, external_excel):
             if not os.path.exists(path):
                 continue
@@ -1525,36 +1507,25 @@ class ExactLeagueFilter:
                 logger.debug(f"⚠️ Ошибка чтения фильтра из {path}: {e}")
 
     def is_allowed(self, league_name: str) -> bool:
-        """
-        Проверяет точное соответствие лиги:
-          - Если лига уже есть в таблице фильтра -> возвращает True (для 1) или False (для 0).
-          - Если лиги еще нет в таблице -> автоматически выставляет 0 для плей-офф/молодежек/женщин,
-            иначе ставит DEFAULT_NEW_LEAGUE_VALUE (1 или 0) и регистрирует лигу в списке.
-        """
         clean_name = re.sub(r"\s+", " ", league_name).strip()
         if not clean_name:
             return False
 
         key = self._norm(clean_name)
-
-        # 1. Точное совпадение в базе правил
         if key in self.rules:
             return self.rules[key][1] == 1
 
-        # 2. Новая лига: проверяем маркеры автоматического отключения (Плей-офф, U16..U23, Женщины и т.д.)
         for kw in AUTO_ZERO_KEYWORDS:
             if kw in key:
                 self.rules[key] = (clean_name, 0)
                 return False
 
-        # 3. Обычная новая лига -> присваиваем DEFAULT_NEW_LEAGUE_VALUE (1 или 0)
         default_status = 1 if DEFAULT_NEW_LEAGUE_VALUE == 1 else 0
         self.rules[key] = (clean_name, default_status)
         return default_status == 1
 
     def to_dataframe(self) -> pd.DataFrame:
         rows: list[dict[str, Any]] = []
-        # Сортируем по алфавиту названия лиги (как в вашем примере)
         sorted_items = sorted(self.rules.values(), key=lambda x: x[0].upper())
         for orig_name, status in sorted_items:
             rows.append({
@@ -1770,10 +1741,6 @@ def load_existing_excel(
         if df_dup is not None
         else []
     )
-
-    # Применяем актуальный фильтр 0/1 даже в режиме REFRESH (если пользователь отключил лигу = 0)
-    unique_rows = [r for r in unique_rows if filter_mgr.is_allowed(str(r.get("Лига", "")))]
-    duplicate_rows = [r for r in duplicate_rows if filter_mgr.is_allowed(str(r.get("Лига", "")))]
 
     mark_duplicate_flags(unique_rows, duplicate_rows)
 
@@ -2028,7 +1995,6 @@ def save_movement_excel(
         _format_league_filter_sheet(wb["Фильтр лиг"], has_count_col=True)
         wb.save(path)
 
-        # Синхронно обновляем внешний файл фильтра leagues_filter.xlsx
         filter_mgr.save_external_filter_file(EXTERNAL_FILTER_EXCEL)
     except PermissionError:
         logger.error(f"❌ Ошибка сохранения: закройте файл {path} в Excel!")
@@ -2037,7 +2003,7 @@ def save_movement_excel(
 
 
 # ============================================================================
-# КЛАСС ПАРСЕРА (РАСПИСАНИЕ НА МЕСЯЦ + СТАРТОВЫЕ/ТЕКУЩИЕ КЭФЫ + REFRESH)
+# КЛАСС ПАРСЕРА (АВТОПЕРЕХВАТ GEOIP ДЛЯ КЭФОВ + REFRESH ПО ID МАТЧА)
 # ============================================================================
 
 class FutureOddsMovementParser:
@@ -2050,26 +2016,48 @@ class FutureOddsMovementParser:
 
         self.matches: dict[str, dict[str, Any]] = {}
         self.tournaments: dict[str, dict[str, str]] = {}
+        self.odds_profiles: list[dict[str, str]] = list(FALLBACK_ODDS_PROFILES)
 
-    async def bootstrap(self, browser: Any, fast_refresh: bool = False) -> BrowserContext:
+    async def bootstrap(
+        self, browser: Any, sample_match_id: Optional[str] = None
+    ) -> BrowserContext:
+        """
+        Инициализирует контекст Playwright и автоматически перехватывает реальные параметры
+        запроса коэффициентов (projectId, geoIpCode, geoIpSubdivisionCode, X-Fsign)
+        на примере первого match_id.
+        """
         context: BrowserContext = await browser.new_context(user_agent=USER_AGENT, locale="ru-RU")
-        if fast_refresh:
-            logger.info("⚡ Быстрый старт Refresh Mode (без загрузки главной страницы)")
-            return context
-
         page = await context.new_page()
-        try:
-            await page.goto(
-                f"{self.base_domain}/football/",
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
-            try:
-                await page.wait_for_load_state("networkidle", timeout=8000)
-            except Exception:
-                pass
 
-            await asyncio.sleep(1.5)
+        captured_profile: dict[str, str] = {}
+
+        def _on_request(req: Request) -> None:
+            if "pq_graphql" in req.url and ("oce" in req.url or "odds" in req.url):
+                parsed_u = urlparse(req.url)
+                qs = parse_qs(parsed_u.query)
+                p_id = (qs.get("projectId") or [PROJECT_ID])[0]
+                g_code = (qs.get("geoIpCode") or [""])[0]
+                g_sub = (qs.get("geoIpSubdivisionCode") or [""])[0]
+                h_val = (qs.get("_hash") or ["oce"])[0]
+                if g_code:
+                    captured_profile["_hash"] = h_val
+                    captured_profile["projectId"] = p_id
+                    captured_profile["geoIpCode"] = g_code
+                    captured_profile["geoIpSubdivisionCode"] = g_sub
+                fsign_hdr = req.headers.get("x-fsign")
+                if fsign_hdr:
+                    self.feed_sign = fsign_hdr
+
+        page.on("request", _on_request)
+
+        try:
+            target_url = (
+                f"{self.base_domain}/match/{sample_match_id}/#/odds-comparison"
+                if sample_match_id
+                else f"{self.base_domain}/football/"
+            )
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+            await asyncio.sleep(2.5)
 
             env = await page.evaluate(
                 """() => {
@@ -2078,23 +2066,48 @@ class FutureOddsMovementParser:
                         if (!env) return null;
                         return {
                             feed_sign: env.feed_sign || (env.config && env.config.feed_sign) || null,
-                            api_domain: env.feed_resolver?.local?.[0]?.url || null
+                            api_domain: env.feed_resolver?.local?.[0]?.url || null,
+                            project_id: env.project_id || env.config?.project_id || null,
+                            geo_ip: env.geo_ip_code || env.geoIpCode || env.config?.geoIpCode || null,
+                            geo_sub: env.geo_ip_subdivision_code || env.geoIpSubdivisionCode || env.config?.geoIpSubdivisionCode || null
                         };
                     } catch(e) { return null; }
                 }"""
             )
             if isinstance(env, dict):
-                self.feed_sign = str(env.get("feed_sign") or DEFAULT_FEED_SIGN)
+                if env.get("feed_sign"):
+                    self.feed_sign = str(env["feed_sign"])
                 raw_domain = str(env.get("api_domain") or DEFAULT_API_DOMAIN)
                 m_host = re.match(r"^(https?://[^/]+)", raw_domain)
                 if m_host:
                     self.api_domain = m_host.group(1)
 
-            logger.info(f"🌐 API: {self.api_domain} | Feed Sign: {self.feed_sign}")
+                if not captured_profile and env.get("geo_ip"):
+                    captured_profile = {
+                        "_hash": "oce",
+                        "projectId": str(env.get("project_id") or PROJECT_ID),
+                        "geoIpCode": str(env.get("geo_ip")),
+                        "geoIpSubdivisionCode": str(env.get("geo_sub") or ""),
+                    }
+
+            if captured_profile:
+                self.odds_profiles = [captured_profile] + [
+                    p for p in FALLBACK_ODDS_PROFILES if p != captured_profile
+                ]
+                logger.info(
+                    f"🎯 Перехвачен профиль кэфов: projectId={captured_profile.get('projectId')} | "
+                    f"geoIpCode={captured_profile.get('geoIpCode')} | "
+                    f"geoIpSubdivisionCode={captured_profile.get('geoIpSubdivisionCode')}"
+                )
+            else:
+                logger.info(
+                    f"🌐 API: {self.api_domain} | Feed Sign: {self.feed_sign} (используются резервные профили кэфов)"
+                )
+
             return context
         except Exception as e:
-            await context.close()
-            raise RuntimeError(f"Bootstrap failed: {e}")
+            logger.warning(f"⚠️ Предупреждение bootstrap ({e}), продолжаем с базовыми профилями...")
+            return context
         finally:
             if not page.is_closed():
                 await page.close()
@@ -2113,11 +2126,6 @@ class FutureOddsMovementParser:
 
     @staticmethod
     def _clean_league_name(name: str) -> str:
-        """
-        Убирает номер тура ('- Тур 12', '- Round 5'), но СОХРАНЯЕТ стадии
-        '- Плей-офф', '- Понижение (плей-офф)', '- Матчи за место', '- Женщины',
-        чтобы точный фильтр 0/1 работал один-в-один с названиями Flashscore.
-        """
         name = re.sub(r"\s*-\s*(Тур|Round)\s*\d+", "", name, flags=re.IGNORECASE)
         name = re.sub(r"Новое окно", "", name, flags=re.IGNORECASE)
         name = re.sub(r"\s+", " ", name)
@@ -2129,7 +2137,6 @@ class FutureOddsMovementParser:
         target_dates: set[date],
         locked_league: str = "",
     ) -> int:
-        # Декодируем возможные экранированные разделители из HTML /fixtures/
         if "\\u00f7" in text or "\\u00ac" in text:
             text = text.replace("\\u00f7", SEP_KV).replace("\\u00ac", SEP_CELL)
 
@@ -2142,7 +2149,6 @@ class FutureOddsMovementParser:
                 continue
             kv = self._extract_kv_dict(row)
 
-            # 1. Заголовок лиги
             if "ZA" in kv and not locked_league:
                 raw_za = kv.get("ZA", "").strip()
                 if raw_za:
@@ -2152,7 +2158,6 @@ class FutureOddsMovementParser:
                     else:
                         current_league = self._clean_league_name(raw_za)
 
-                    # Регистрируем лигу в фильтре и проверяем ее статус (1 или 0)
                     league_allowed = self.filter_mgr.is_allowed(current_league)
 
                     zb = kv.get("ZB", "").strip()
@@ -2170,11 +2175,9 @@ class FutureOddsMovementParser:
                             "zl": zl,
                         }
 
-            # Если у лиги стоит 0 — пропускаем все ее матчи
             if not league_allowed or not current_league:
                 continue
 
-            # 2. Строка матча
             if "AA" in kv:
                 match_id = re.sub(r"[^A-Za-z0-9]", "", kv["AA"].strip())
                 ts_str = kv.get("AD", "").strip()
@@ -2240,7 +2243,7 @@ class FutureOddsMovementParser:
                     added = self.parse_feed_payload(text, target_dates)
                     logger.info(
                         f"📅 Дневной фид (offset={day_offset:+d}): +{added} матчей "
-                        f"| Разрешенных лиг (1): {len(self.tournaments)} | Всего в фильтре: {len(self.filter_mgr.rules)}"
+                        f"| Разрешенных лиг (1): {len(self.tournaments)}"
                     )
         except Exception as e:
             logger.debug(f"⚠️ Ошибка дневного фида offset={day_offset}: {e}")
@@ -2261,7 +2264,6 @@ class FutureOddsMovementParser:
             zl = t_info.get("zl", "")
             added_total = 0
 
-            # 1. API-фиды турнира (t_1_)
             feed_ids = [x for x in {zee, ze} if x]
             for fid in feed_ids:
                 if not zb:
@@ -2278,7 +2280,6 @@ class FutureOddsMovementParser:
                 except Exception as e:
                     logger.debug(f"⚠️ Ошибка t_1_ {league_name}: {e}")
 
-            # 2. Календарь будущих туров /{zl}/fixtures/ (на месяц+ вперед)
             if zl:
                 clean_zl = zl if zl.endswith("/") else f"{zl}/"
                 fixtures_url = f"{self.base_domain}{clean_zl}fixtures/"
@@ -2301,7 +2302,7 @@ class FutureOddsMovementParser:
                     logger.debug(f"⚠️ Ошибка /fixtures/ {league_name}: {e}")
 
             if added_total > 0:
-                logger.info(f"  🏆 [{league_name}] +{added_total} будущих матчей на месяц вперед")
+                logger.info(f"  🏆 [{league_name}] +{added_total} будущих матчей")
 
             await asyncio.sleep(random.uniform(0.08, 0.2))
 
@@ -2472,7 +2473,9 @@ class FutureOddsMovementParser:
                 items = [x for x in (entry.get("odds") or []) if isinstance(x, dict)]
                 matching = [
                     it for it in items
-                    if self._normalize_handicap(it.get("handicap")) == total_str
+                    if self._normalize_handicap(
+                        it.get("handicap") if it.get("handicap") is not None else entry.get("handicap")
+                    ) == total_str
                 ]
                 if len(matching) < 2:
                     continue
@@ -2481,10 +2484,10 @@ class FutureOddsMovementParser:
                 under_pair: tuple[Optional[float], Optional[float]] = (None, None)
 
                 for it in matching:
-                    sel = str(it.get("selection") or it.get("overUnder") or "").upper()
-                    if sel in ("OVER", "TRUE", "1"):
+                    sel = str(it.get("selection") or it.get("overUnder") or it.get("type") or "").upper()
+                    if sel in ("OVER", "TRUE", "1", "O"):
                         over_pair = self._extract_odd_pair(it)
-                    elif sel in ("UNDER", "FALSE", "0"):
+                    elif sel in ("UNDER", "FALSE", "0", "U"):
                         under_pair = self._extract_odd_pair(it)
 
                 if over_pair[1] is None and under_pair[1] is None:
@@ -2555,9 +2558,10 @@ class FutureOddsMovementParser:
             }
             merged_odds: dict[str, Any] = {}
 
-            for prof in ODDS_QUERY_PROFILES:
+            for prof in self.odds_profiles:
+                h_val = prof.get("_hash", "oce")
                 url = (
-                    f"{ODDS_GRAPHQL_URL}?_hash=oce"
+                    f"{ODDS_GRAPHQL_URL}?_hash={h_val}"
                     f"&eventId={match_id}"
                     f"&projectId={prof['projectId']}"
                     f"&geoIpCode={prof['geoIpCode']}"
@@ -2575,10 +2579,16 @@ class FutureOddsMovementParser:
                             if "П1__curr" in merged_odds and "ТБ\n2,5__curr" in merged_odds:
                                 break
                 except Exception as e:
-                    logger.debug(f"⚠️ Ошибка кэфов для {match_id} ({prof['geoIpCode']}): {e}")
+                    logger.debug(f"⚠️ Ошибка кэфов для {match_id} ({prof.get('geoIpCode')}): {e}")
 
             if merged_odds:
                 self._apply_odds_update(match_id, merged_odds, is_refresh=is_refresh)
+                m_row = self.matches.get(match_id, {})
+                logger.info(
+                    f"  💰 [{match_id}] {m_row.get('HOME', '')} - {m_row.get('AWAY', '')} | "
+                    f"П1: {m_row.get('П1__open')}->{m_row.get('П1__curr')} | "
+                    f"ТБ2.5: {m_row.get('ТБ\n2,5__open')}->{m_row.get('ТБ\n2,5__curr')}"
+                )
                 await asyncio.sleep(random.uniform(0.04, 0.1))
                 return True
 
@@ -2640,24 +2650,22 @@ async def main() -> None:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
         try:
             # ================================================================
-            # ВЕТКА А: РЕЖИМ БЫСТРОГО ОБНОВЛЕНИЯ (REFRESH MODE)
+            # ВЕТКА А: РЕЖИМ БЫСТРОГО ОБНОВЛЕНИЯ ПО ID МАТЧА (REFRESH MODE)
             # ================================================================
             if mode == "REFRESH":
                 if not os.path.exists(OUTPUT_EXCEL):
                     logger.error(f"❌ Файл {OUTPUT_EXCEL} не найден! Запустите сначала режим FULL.")
                     return
 
-                logger.info(f"🔄 ЗАПУСК РЕЖИМА БЫСТРОГО ОБНОВЛЕНИЯ (Refresh Mode): {OUTPUT_EXCEL}")
+                logger.info(f"🔄 ЗАПУСК ОБНОВЛЕНИЯ КОЭФФИЦИЕНТОВ ПО ID МАТЧА из файла: {OUTPUT_EXCEL}")
                 matches_dict, unique_rows, duplicate_rows = load_existing_excel(
                     OUTPUT_EXCEL, parser.timezone, filter_mgr
                 )
                 parser.matches = matches_dict
 
                 if not parser.matches:
-                    logger.warning("⚠️ В файле не найдено разрешенных матчей для обновления.")
+                    logger.warning("⚠️ В файле не найдено матчей для обновления.")
                     return
-
-                context = await parser.bootstrap(browser, fast_refresh=True)
 
                 candidate_rows = (
                     unique_rows + duplicate_rows
@@ -2670,17 +2678,22 @@ async def main() -> None:
                     target_odds_ids = [
                         str(r["ID матча"])
                         for r in candidate_rows
-                        if int(r.get("_sort_ts", 0)) == 0 or int(r.get("_sort_ts", 0)) > now_ts
+                        if int(r.get("_sort_ts", 0)) == 0
+                        or int(r.get("_sort_ts", 0)) > now_ts
+                        or r.get("П1__curr") == ""
                     ]
                     skipped_started = len(candidate_rows) - len(target_odds_ids)
                 else:
                     target_odds_ids = [str(r["ID матча"]) for r in candidate_rows]
                     skipped_started = 0
 
+                sample_mid = target_odds_ids[0] if target_odds_ids else None
+                context = await parser.bootstrap(browser, sample_match_id=sample_mid)
+
                 total_targets = len(target_odds_ids)
                 logger.info(
-                    f"📊 Загружено: Уникальных = {len(unique_rows)} | Дубликатов = {len(duplicate_rows)} | "
-                    f"К обновлению кэфов = {total_targets} (пропущено начавшихся: {skipped_started})"
+                    f"📊 Найдено в Excel: Уникальных = {len(unique_rows)} | Дубликатов = {len(duplicate_rows)} | "
+                    f"К обновлению кэфов = {total_targets}"
                 )
 
                 sem_odds = asyncio.Semaphore(MAX_CONCURRENT)
@@ -2700,11 +2713,13 @@ async def main() -> None:
                     if processed % SAVE_EVERY == 0 or processed == total_targets:
                         save_movement_excel(unique_rows, duplicate_rows, filter_mgr, OUTPUT_EXCEL)
                         logger.info(
-                            f"💾 [REFRESH] Проверено: {processed}/{total_targets} "
-                            f"(с кэфами: {with_odds_count}) -> {OUTPUT_EXCEL}"
+                            f"💾 [REFRESH] Проверено ID: {processed}/{total_targets} "
+                            f"(обновлено с кэфами: {with_odds_count}) -> {OUTPUT_EXCEL}"
                         )
 
-                logger.info(f"🎉 ОБНОВЛЕНИЕ ЗАВЕРШЕНО! Файл: {OUTPUT_EXCEL}")
+                logger.info(
+                    f"🎉 ОБНОВЛЕНИЕ ЗАВЕРШЕНО! Обновлено матчей с кэфами: {with_odds_count}/{total_targets} | Файл: {OUTPUT_EXCEL}"
+                )
                 return
 
             # ================================================================
@@ -2718,7 +2733,7 @@ async def main() -> None:
                 f"(дней: {len(target_dates)})"
             )
 
-            context = await parser.bootstrap(browser, fast_refresh=False)
+            context = await parser.bootstrap(browser, sample_match_id=None)
             feed_headers = {
                 "X-Fsign": parser.feed_sign,
                 "Accept": "*/*",
@@ -2726,16 +2741,13 @@ async def main() -> None:
                 "Referer": f"{BASE_DOMAIN}/football/",
             }
 
-            # ЭТАП 1: Сканируем дневные фиды (-3 .. +7 дней)
             logger.info("🚀 Этап 1/3: Сканирование дневных фидов (-3..+7 дней) и фильтрация лиг (1/0)...")
             for offset in range(-3, 8):
                 await parser.fetch_daily_feed(context, offset, feed_headers, target_dates)
                 await asyncio.sleep(0.2)
 
-            # Сохраняем полный список обнаруженных лиг в leagues_filter.xlsx сразу после 1-го этапа
             filter_mgr.save_external_filter_file(EXTERNAL_FILTER_EXCEL)
 
-            # ЭТАП 2: Загрузка расписания на месяц вперед из каждого разрешенного турнира (1)
             max_offset_needed = (max_date - now_in_tz).days
             if max_offset_needed > 7 and parser.tournaments:
                 tour_list = list(parser.tournaments.values())
@@ -2761,30 +2773,25 @@ async def main() -> None:
                     )
 
             if not parser.matches:
-                # Даже если матчей нет, сохраняем книгу с листом 'Фильтр лиг', чтобы его можно было настроить
                 save_movement_excel([], [], filter_mgr, OUTPUT_EXCEL)
-                logger.warning(
-                    f"⚠️ Матчи не найдены. Проверьте выставленные 0 и 1 на листе 'Фильтр лиг' в {OUTPUT_EXCEL}."
-                )
+                logger.warning(f"⚠️ Матчи не найдены. Проверьте лист 'Фильтр лиг' в {OUTPUT_EXCEL}.")
                 return
 
-            # РАЗДЕЛЕНИЕ НА УНИКАЛЬНЫЕ КОМАНДЫ И ДУБЛИКАТЫ ВНУТРИ КАЖДОЙ ЛИГИ
             all_sorted_rows = sorted(
                 parser.matches.values(),
                 key=lambda x: (int(x.get("_sort_ts", 0)), str(x.get("Лига", "")), str(x.get("HOME", ""))),
             )
             unique_rows, duplicate_rows = split_unique_and_duplicates(all_sorted_rows)
 
-            logger.info(
-                f"🔍 Фильтр уникальных команд ({UNIQUE_SCOPE}): "
-                f"В основную таблицу = {len(unique_rows)} | В 'Дубликаты команд' = {len(duplicate_rows)}"
-            )
-
-            # ЭТАП 3: Загрузка стартовых (opening) и текущих (value) коэффициентов
             if FETCH_ODDS_FOR_DUPLICATES:
                 target_odds_ids = [str(r["ID матча"]) for r in all_sorted_rows]
             else:
                 target_odds_ids = [str(r["ID матча"]) for r in unique_rows]
+
+            # Перехватываем точный GeoIP профиль на первом найденном матче перед массовым опросом
+            if target_odds_ids:
+                await context.close()
+                context = await parser.bootstrap(browser, sample_match_id=target_odds_ids[0])
 
             total_odds_targets = len(target_odds_ids)
             logger.info(
@@ -2822,7 +2829,7 @@ async def main() -> None:
                     )
 
             logger.info(
-                f"🎉 ГОТОВО! Файл {OUTPUT_EXCEL} и фильтр {EXTERNAL_FILTER_EXCEL} сохранены | "
+                f"🎉 ГОТОВО! Файл {OUTPUT_EXCEL} сохранен | "
                 f"Уникальных: {len(unique_rows)}, Дубликатов: {len(duplicate_rows)}, С кэфами: {with_odds_count}"
             )
 
